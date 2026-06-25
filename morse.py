@@ -271,12 +271,202 @@ class MaquinaTuringTextoMorse:
               f"cabezal={self.cinta.cabezal:<4} cinta={self.cinta.a_string()!r}")
 
 
+class MaquinaTuringMorseTexto:
+    """
+    Implementa Q_control U Q_morse->texto para el sentido Morse -> Texto.
+    """
+
+    DELIMITADOR = "#"
+    SEP_LETRA = " "
+    MARCA = "'"
+
+    TABLA_MORSE = {
+        "A": ".-",    "B": "-...",  "C": "-.-.",  "D": "-..",
+        "E": ".",     "F": "..-.",  "G": "--.",   "H": "....",
+        "I": "..",    "J": ".---",  "K": "-.-",   "L": ".-..",
+        "M": "--",    "N": "-.",    "O": "---",   "P": ".--.",
+        "Q": "--.-",  "R": ".-.",   "S": "...",   "T": "-",
+        "U": "..-",   "V": "...-",  "W": ".--",   "X": "-..-",
+        "Y": "-.--",  "Z": "--..",
+    }
+    TABLA_TEXTO = {codigo: letra for letra, codigo in TABLA_MORSE.items()}
+    TABLA_TEXTO["/"] = " "
+
+    # Estados de Q_control U Q_morse->texto
+    Q0 = "q0"
+    Q_BUSCAR = "q_buscar_codigo"
+    Q_LEER = "q_leer_codigo"
+    Q_FINAL_ENTRADA = "q_final_entrada"
+    Q_ESCRIBIR = "q_escribir_texto"
+    Q_LIMPIEZA = "q_limpieza"
+    Q_F = "q_f"
+
+    def __init__(self, morse: str, verbose: bool = False):
+        morse = morse.strip()
+        self._validar_entrada(morse)
+
+        self.entrada_len = len(morse)
+        self.cinta = Cinta(morse)
+        self.estado = self.Q0
+        self.verbose = verbose
+        self.pasos = 0
+        self._codigo_actual = ""
+        self._pos_busqueda = 0
+
+    # -- Validacion ---------------------------------------------------------
+    def _validar_entrada(self, morse: str) -> None:
+        """Valida que la entrada solo contenga simbolos Morse aceptados."""
+        for caracter in morse:
+            if caracter not in {".", "-", "/", " "}:
+                raise ValueError(
+                    f"Simbolo '{caracter}' no pertenece al alfabeto de "
+                    f"entrada (Sigma) para el sentido morse->texto."
+                )
+        if not morse:
+            raise ValueError("La cadena de entrada no puede estar vacia.")
+
+    # -- Ejecucion ------------------------------------------------------------
+    def ejecutar(self) -> str:
+        """Corre la maquina hasta q_f y devuelve la traduccion a texto."""
+        self.estado = self.Q_BUSCAR
+
+        limite_pasos = 100_000  # red de seguridad anti-loop-infinito
+        while self.estado != self.Q_F and self.pasos < limite_pasos:
+            self._delta()
+            self.pasos += 1
+            if self.verbose:
+                self._traza()
+
+        if self.pasos >= limite_pasos:
+            raise RuntimeError("La maquina no se detuvo (posible ciclo).")
+
+        return self._resultado_texto()
+
+    # -- Funcion de transicion delta -------------------------------------------
+    def _delta(self) -> None:
+        """Despacha el comportamiento segun el estado actual."""
+        despachador = {
+            self.Q_BUSCAR: self._estado_buscar_codigo,
+            self.Q_LEER: self._estado_leer_codigo,
+            self.Q_FINAL_ENTRADA: self._estado_final_entrada,
+            self.Q_ESCRIBIR: self._estado_escribir_texto,
+            self.Q_LIMPIEZA: self._estado_limpieza,
+        }
+        funcion = despachador.get(self.estado)
+        if funcion is None:
+            raise RuntimeError(f"Estado no reconocido: {self.estado}")
+        funcion()
+
+    def _estado_buscar_codigo(self) -> None:
+        """
+        q_buscar_codigo: recorre la entrada Morse en busca del inicio de una
+        secuencia no procesada.
+        """
+        self.cinta.ir_a(self._pos_busqueda)
+
+        if self._pos_busqueda >= self.entrada_len:
+            self.estado = self.Q_LIMPIEZA
+            return
+
+        simbolo = self.cinta.leer()
+        if simbolo == self.SEP_LETRA or simbolo == self.cinta.BLANCO:
+            self._pos_busqueda += 1
+            return
+
+        if simbolo.endswith(self.MARCA):
+            self._pos_busqueda += 1
+            return
+
+        self._codigo_actual = ""
+        self.estado = self.Q_LEER
+
+    def _estado_leer_codigo(self) -> None:
+        """
+        q_leer_codigo: acumula simbolos Morse hasta encontrar el separador
+        de letra o un blanco.
+        """
+        simbolo = self.cinta.leer()
+
+        if (simbolo == self.SEP_LETRA or simbolo == self.cinta.BLANCO
+                or self.cinta.cabezal >= self.entrada_len):
+            self.estado = self.Q_FINAL_ENTRADA
+            return
+
+        if simbolo == "/":
+            self._codigo_actual = "/"
+            self.cinta.escribir(simbolo + self.MARCA)
+            self.cinta.mover(Direccion.DERECHA)
+            self.estado = self.Q_FINAL_ENTRADA
+            return
+
+        self._codigo_actual += simbolo
+        self.cinta.escribir(simbolo + self.MARCA)
+        self.cinta.mover(Direccion.DERECHA)
+
+        siguiente = self.cinta.leer()
+        if (siguiente == self.SEP_LETRA or siguiente == self.cinta.BLANCO
+                or self.cinta.cabezal >= self.entrada_len):
+            self.estado = self.Q_FINAL_ENTRADA
+
+    def _estado_final_entrada(self) -> None:
+        """
+        q_final_entrada: ubica el delimitador #. Si todavia no existe
+        (primera letra traducida), lo crea justo despues de la entrada.
+        """
+        pos_delim = self.entrada_len
+        if self.cinta.leer_en(pos_delim) != self.DELIMITADOR:
+            self.cinta.ir_a(pos_delim)
+            self.cinta.escribir(self.DELIMITADOR)
+
+        destino = self.cinta.primer_blanco_desde(pos_delim + 1)
+        self.cinta.ir_a(destino)
+        self.estado = self.Q_ESCRIBIR
+
+    def _estado_escribir_texto(self) -> None:
+        """
+        q_escribir_texto: convierte el codigo Morse acumulado a texto y lo
+        escribe en la cinta de salida (zona posterior al delimitador #).
+        """
+        caracter = self.TABLA_TEXTO.get(self._codigo_actual)
+        if caracter is None:
+            raise ValueError(
+                f"Codigo Morse '{self._codigo_actual}' no corresponde a ninguna letra."
+            )
+
+        self.cinta.escribir(caracter)
+        self.estado = self.Q_BUSCAR
+
+    def _estado_limpieza(self) -> None:
+        """q_limpieza: finaliza la ejecucion sin modificar la cinta."""
+        self.estado = self.Q_F
+
+    # -- Resultado / utilidades -------------------------------------------------
+    def _resultado_texto(self) -> str:
+        contenido = self.cinta.a_string()
+        _, _, salida = contenido.partition(self.DELIMITADOR)
+        return salida
+
+    def cinta_completa(self) -> str:
+        """Devuelve la cinta completa (entrada Morse + # + salida texto)."""
+        return self.cinta.a_string()
+
+    def _traza(self) -> None:
+        print(f"[paso {self.pasos:>3}] estado={self.estado:<20} "
+              f"cabezal={self.cinta.cabezal:<4} cinta={self.cinta.a_string()!r}")
+
+
 # ---------------------------------------------------------------------------
 # Interfaz de alto nivel (la usara el modulo de integracion / main)
 # ---------------------------------------------------------------------------
 def texto_a_morse(texto: str, verbose: bool = False) -> str:
     """Funcion de conveniencia: traduce una cadena de texto a Morse."""
     maquina = MaquinaTuringTextoMorse(texto, verbose=verbose)
+    return maquina.ejecutar()
+
+
+def morse_a_texto(morse: str, verbose: bool = False) -> str:
+    """Funcion de conveniencia: traduce una cadena en Morse a texto."""
+    maquina = MaquinaTuringMorseTexto(morse, verbose=verbose)
     return maquina.ejecutar()
 
 
@@ -294,4 +484,17 @@ if __name__ == "__main__":
         resultado = texto_a_morse(caso)
         print(f"Texto:  {caso}")
         print(f"Morse:  {resultado}")
+        print("-" * 40)
+
+    print("\nPruebas inversas:")
+    casos_morse = [
+        "... --- ...",
+        ".... --- .-.. .- / -- ..- -. -.. ---",
+        ".. .--. -.",
+    ]
+
+    for caso in casos_morse:
+        resultado = morse_a_texto(caso)
+        print(f"Morse:  {caso}")
+        print(f"Texto:  {resultado}")
         print("-" * 40)
